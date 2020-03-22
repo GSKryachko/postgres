@@ -4,6 +4,7 @@ MODULE_big	= amcheck
 OBJS = \
 	$(WIN32RES) \
 	amcheck.o \
+	verify_gin.o \
 	verify_gist.o \
 	verify_nbtree.o
 
@@ -14,7 +15,7 @@ DATA =  amcheck--1.2--1.3.sql \
 	amcheck--1.0.sql
 PGFILEDESC = "amcheck - function for verifying relation integrity"
 
-REGRESS = check check_btree check_gist
+REGRESS = check check_btree check_gin check_gist
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

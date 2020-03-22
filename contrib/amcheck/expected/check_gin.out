@@ -1,0 +1,18 @@
+-- minimal test, basically just verifying that amcheck works with GiST
+SELECT setseed(1);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE gin_check AS SELECT point(random(),s) c FROM generate_series(1,10000) s;
+INSERT INTO gin_check SELECT point(random(),s) c FROM generate_series(1,100000) s;
+CREATE INDEX gin_check_idx ON gin_check USING gin(c);
+SELECT gin_index_parent_check('gin_check_idx');
+ gin_index_parent_check 
+-------------------------
+ 
+(1 row)
+
+-- cleanup
+DROP TABLE gin_check;
