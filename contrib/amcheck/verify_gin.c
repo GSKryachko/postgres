@@ -249,7 +249,7 @@ check_index_page(Relation rel, Buffer buffer, BlockNumber blockNo)
 {
 	Page		page = BufferGetPage(buffer);
 
-//	gistcheckpage(rel, buffer);
+	gincheckpage(rel, buffer);
 
 	if (GinPageIsDeleted(page))
 	{
