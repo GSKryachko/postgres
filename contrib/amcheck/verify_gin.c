@@ -163,6 +163,28 @@ gin_check_parent_keys_consistency(Relation rel)
 		/* Do basic sanity checks on the page headers */
 		check_index_page(rel, buffer, stack->blkno);
 
+        /*
+         * It's possible that the page was split since we looked at the
+         * parent, so that we didn't missed the downlink of the right sibling
+         * when we scanned the parent.  If so, add the right sibling to the
+         * stack now.
+         */
+        if (!GinPageRightMost(page) &&
+            ginCompareItemPointers(&stack->parenttup->t_tid, GinDataPageGetRightBound(page)) >= 0)
+        {
+            /* split page detected, install right link to the stack */
+            GinScanItem *ptr = (GinScanItem *) palloc(sizeof(GinScanItem));
+
+            ptr->depth = stack->depth;
+            ptr->parenttup = CopyIndexTuple(stack->parenttup);
+            ptr->parentblk = stack->parentblk;
+            ptr->parentlsn = stack->parentlsn;
+            ptr->blkno = GinPageGetOpaque(page)->rightlink;
+            ptr->next = stack->next;
+            stack->next = ptr;
+        }
+
+
 		/* Check that the tree has the same height in all branches */
 		if (GinPageIsLeaf(page))
 		{
