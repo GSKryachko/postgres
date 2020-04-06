@@ -108,13 +108,7 @@ gin_index_checkable(Relation rel)
 
 /*
  * Main entry point for GIN check. Allocates memory context and scans through
- * GIN graph.  This function verifies that tuples of internal pages cover all
- * the key space of each tuple on leaf page.  To do this we invoke
- * gin_check_internal_page() for every internal page.
- *
- * giin_check_internal_page() in it's turn takes every tuple and tries to
- * adjust it by tuples on referenced child page.  Parent gin tuple should
- * never require any adjustments.
+ * GIN graph.
  */
 static void
 gin_check_parent_keys_consistency(Relation rel)
@@ -123,17 +117,21 @@ gin_check_parent_keys_consistency(Relation rel)
 	GinScanItem *stack;
 	MemoryContext mctx;
 	MemoryContext oldcontext;
-	int			leafdepth;
+    GinState  *state;
+
+    int			leafdepth;
 
 	mctx = AllocSetContextCreate(CurrentMemoryContext,
 								 "amcheck context",
 								 ALLOCSET_DEFAULT_SIZES);
 	oldcontext = MemoryContextSwitchTo(mctx);
+    state = (GinState *) palloc(sizeof(GinState));
+    initGinState(state, rel);
 
-	/*
-	 * We don't know the height of the tree yet, but as soon as we encounter a
-	 * leaf page, we will set 'leafdepth' to its depth.
-	 */
+    /*
+     * We don't know the height of the tree yet, but as soon as we encounter a
+     * leaf page, we will set 'leafdepth' to its depth.
+     */
 	leafdepth = -1;
 
 	/* Start the scan at the root page */
@@ -198,14 +196,15 @@ gin_check_parent_keys_consistency(Relation rel)
 		}
 
 		/*
-		 * Check that each tuple looks valid, and is consistent with the
-		 * downlink we followed when we stepped on this page.
+		 * Check that tuples in each page are properly ordered and consistent with parent high key
 		 */
 		maxoff = PageGetMaxOffsetNumber(page);
+        IndexTuple prev_tuple = NULL;
 		for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
 		{
 			ItemId iid = PageGetItemIdCareful(rel, stack->blkno, page, i, sizeof(GinPageOpaqueData));
 			IndexTuple	idxtuple = (IndexTuple) PageGetItem(page, iid);
+            OffsetNumber attnum = gintuple_get_attrnum(state, idxtuple);
 
 			if (MAXALIGN(ItemIdGetLength(iid)) != MAXALIGN(IndexTupleSize(idxtuple)))
 				ereport(ERROR,
@@ -213,7 +212,66 @@ gin_check_parent_keys_consistency(Relation rel)
 						 errmsg("index \"%s\" has inconsistent tuple sizes, block %u, offset %u",
 								RelationGetRelationName(rel), stack->blkno, i)));
 
-			/* If this is an internal page, recurse into the child */
+            GinNullCategory prev_key_category;
+            Datum prev_key;
+            GinNullCategory current_key_category;
+            Datum current_key = gintuple_get_key(state, idxtuple, &current_key_category);
+
+            if (i != FirstOffsetNumber) {
+                prev_key = gintuple_get_key(state, prev_tuple, &prev_key_category);
+
+                if (ginCompareEntries(state, attnum, prev_key, current_key, prev_key_category, current_key_category) <= 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INDEX_CORRUPTED),
+                                    errmsg("index \"%s\" has wrong tuple order, block %u, offset %u",
+                                           RelationGetRelationName(rel), stack->blkno, i)));
+
+            }
+
+            /*
+             * Check if this tuple is consistent with the downlink in the
+             * parent.
+             */
+            if (stack->parenttup &&
+                i == maxoff) {
+                GinNullCategory parent_key_category;
+                Datum parent_key = gintuple_get_key(state, stack->parenttup, &parent_key_category);
+
+                if (ginCompareEntries(state, attnum, current_key, parent_key, current_key_category, parent_key_category) <= 0) {
+
+
+                    /*
+                     * There was a discrepancy between parent and child tuples.
+                     * We need to verify it is not a result of concurrent call of
+                     * gistplacetopage(). So, lock parent and try to find downlink
+                     * for current page. It may be missing due to concurrent page
+                     * split, this is OK.
+                     */
+                    pfree(stack->parenttup);
+                    stack->parenttup = gin_refind_parent(rel, stack->parentblk,
+                                                         stack->blkno, strategy);
+
+                    /* We found it - make a final check before failing */
+                    if (!stack->parenttup)
+                        elog(NOTICE, "Unable to find parent tuple for block %u on block %u due to concurrent split",
+                             stack->blkno, stack->parentblk);
+                    else {
+                        parent_key = gintuple_get_key(state, stack->parenttup, &parent_key_category);
+                        if (ginCompareEntries(state, attnum, current_key, parent_key, current_key_category, parent_key_category) <=0)
+                        ereport(ERROR,
+                                (errcode(ERRCODE_INDEX_CORRUPTED),
+                                        errmsg("index \"%s\" has inconsistent records on page %u offset %u",
+                                               RelationGetRelationName(rel), stack->blkno, i)));
+                        else {
+                            /*
+                             * But now it is properly adjusted - nothing to do here.
+                             */
+                        }
+                    }
+                }
+            }
+
+            /* If this is an internal page, recurse into the child */
 			if (!GinPageIsLeaf(page))
 			{
 				GinScanItem *ptr;
@@ -227,6 +285,8 @@ gin_check_parent_keys_consistency(Relation rel)
 				ptr->next = stack->next;
 				stack->next = ptr;
 			}
+
+			prev_tuple = idxtuple;
 		}
 
 		LockBuffer(buffer, GIN_UNLOCK);
@@ -269,4 +329,51 @@ check_index_page(Relation rel, Buffer buffer, BlockNumber blockNo)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" has page %d with exceeding count of tuples",
 						RelationGetRelationName(rel), blockNo)));
+}
+
+/*
+ * Try to re-find downlink pointing to 'blkno', in 'parentblkno'.
+ *
+ * If found, returns a palloc'd copy of the downlink tuple. Otherwise,
+ * returns NULL.
+ */
+static IndexTuple
+gin_refind_parent(Relation rel, BlockNumber parentblkno,
+                   BlockNumber childblkno, BufferAccessStrategy strategy)
+{
+    Buffer		parentbuf;
+    Page		parentpage;
+    OffsetNumber o,
+            parent_maxoff;
+    IndexTuple	result = NULL;
+
+    parentbuf = ReadBufferExtended(rel, MAIN_FORKNUM, parentblkno, RBM_NORMAL,
+                                   strategy);
+
+    LockBuffer(parentbuf, GIN_SHARE);
+    parentpage = BufferGetPage(parentbuf);
+
+    if (GinPageIsLeaf(parentpage))
+    {
+        UnlockReleaseBuffer(parentbuf);
+        return result;
+    }
+
+    parent_maxoff = PageGetMaxOffsetNumber(parentpage);
+    for (o = FirstOffsetNumber; o <= parent_maxoff; o = OffsetNumberNext(o))
+    {
+        ItemId p_iid = PageGetItemIdCareful(rel, parentblkno, parentpage, o, sizeof(GinPageOpaqueData));
+        IndexTuple	itup = (IndexTuple) PageGetItem(parentpage, p_iid);
+
+        if (ItemPointerGetBlockNumber(&(itup->t_tid)) == childblkno)
+        {
+            /* Found it! Make copy and return it */
+            result = CopyIndexTuple(itup);
+            break;
+        }
+    }
+
+    UnlockReleaseBuffer(parentbuf);
+
+    return result;
 }
