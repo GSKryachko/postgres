@@ -167,21 +167,31 @@ gin_check_parent_keys_consistency(Relation rel)
          * when we scanned the parent.  If so, add the right sibling to the
          * stack now.
          */
-        if (!GinPageRightMost(page) &&
-            ginCompareItemPointers(&stack->parenttup->t_tid, GinDataPageGetRightBound(page)) >= 0)
-        {
-            /* split page detected, install right link to the stack */
-            GinScanItem *ptr = (GinScanItem *) palloc(sizeof(GinScanItem));
+        if (stack -> parenttup != NULL ) {
+            GinNullCategory parent_key_category;
+            Datum parent_key = gintuple_get_key(state, stack->parenttup, &parent_key_category);
+            maxoff = PageGetMaxOffsetNumber(page);
+            ItemId iid = PageGetItemIdCareful(rel, stack->blkno, page, maxoff, sizeof(GinPageOpaqueData));
+            IndexTuple idxtuple = (IndexTuple) PageGetItem(page, iid);
+            OffsetNumber attnum = gintuple_get_attrnum(state, idxtuple);
+            GinNullCategory page_max_key_category;
+            Datum page_max_key = gintuple_get_key(state, idxtuple, &page_max_key_category);
 
-            ptr->depth = stack->depth;
-            ptr->parenttup = CopyIndexTuple(stack->parenttup);
-            ptr->parentblk = stack->parentblk;
-            ptr->parentlsn = stack->parentlsn;
-            ptr->blkno = GinPageGetOpaque(page)->rightlink;
-            ptr->next = stack->next;
-            stack->next = ptr;
+            if (GinPageGetOpaque(page)->rightlink != InvalidBlockNumber &&
+            ginCompareEntries(state, attnum, page_max_key, parent_key, page_max_key_category, parent_key_category) <= 0 ) {
+                elog(INFO, "split detected");
+                /* split page detected, install right link to the stack */
+                GinScanItem *ptr = (GinScanItem *) palloc(sizeof(GinScanItem));
+
+                ptr->depth = stack->depth;
+                ptr->parenttup = CopyIndexTuple(stack->parenttup);
+                ptr->parentblk = stack->parentblk;
+                ptr->parentlsn = stack->parentlsn;
+                ptr->blkno = GinPageGetOpaque(page)->rightlink;
+                ptr->next = stack->next;
+                stack->next = ptr;
+            }
         }
-
 
 		/* Check that the tree has the same height in all branches */
 		if (GinPageIsLeaf(page))
