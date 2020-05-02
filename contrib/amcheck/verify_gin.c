@@ -106,6 +106,20 @@ gin_index_checkable(Relation rel)
 				 errdetail("Index is not valid")));
 }
 
+static void validate_leaf(Page page, Relation rel, BlockNumber blkno) {
+    OffsetNumber  i, maxoff;
+    maxoff = PageGetMaxOffsetNumber(page);
+    for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i)) {
+        ItemId iid = PageGetItemIdCareful(rel, blkno, page, i, sizeof(GinPageOpaqueData));
+        IndexTuple idxtuple = (IndexTuple) PageGetItem(page, iid);
+        if (GinIsPostingTree(idxtuple)) {
+            elog(INFO, "validating posting tree on page %u, block %u, offset %u", page, blkno, i);
+        } else {
+            elog(INFO, "validating posting list on page %u, block %u, offset %u", page, blkno, i);
+        }
+    }
+}
+
 /*
  * Main entry point for GIN check. Allocates memory context and scans through
  * GIN graph.
@@ -294,6 +308,8 @@ gin_check_parent_keys_consistency(Relation rel)
 				ptr->parentlsn = lsn;
 				ptr->next = stack->next;
 				stack->next = ptr;
+			} else {
+			    validate_leaf(page, rel, stack->blkno);
 			}
 
 			prev_tuple = idxtuple;
