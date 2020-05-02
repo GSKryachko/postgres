@@ -78,6 +78,44 @@ Datum gin_index_parent_check(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Read item pointers from leaf entry tuple.
+ *
+ * Returns a palloc'd array of ItemPointers. The number of items is returned
+ * in *nitems.
+ */
+ItemPointer
+ginReadTupleWithoutState( IndexTuple itup, int *nitems)
+{
+    Pointer		ptr = GinGetPosting(itup);
+    int			nipd = GinGetNPosting(itup);
+    ItemPointer ipd;
+    int			ndecoded;
+
+    if (GinItupIsCompressed(itup))
+    {
+        if (nipd > 0)
+        {
+            ipd = ginPostingListDecode((GinPostingList *) ptr, &ndecoded);
+            if (nipd != ndecoded)
+                elog(ERROR, "number of items mismatch in GIN entry tuple, %d in tuple header, %d decoded",
+                     nipd, ndecoded);
+        }
+        else
+        {
+            ipd = palloc(0);
+        }
+    }
+    else
+    {
+        ipd = (ItemPointer) palloc(sizeof(ItemPointerData) * nipd);
+        memcpy(ipd, ptr, sizeof(ItemPointerData) * nipd);
+    }
+    *nitems = nipd;
+    return ipd;
+}
+
+
+/*
  * Check that relation is eligible for GIN verification
  */
 static void
@@ -116,6 +154,18 @@ static void validate_leaf(Page page, Relation rel, BlockNumber blkno) {
             elog(INFO, "validating posting tree on page %u, block %u, offset %u", page, blkno, i);
         } else {
             elog(INFO, "validating posting list on page %u, block %u, offset %u", page, blkno, i);
+
+            ItemPointer ipd;
+            int			nipd;
+
+            ipd = ginReadTupleWithoutState(idxtuple, &nipd);
+            if (!OffsetNumberIsValid(ItemPointerGetOffsetNumber(&ipd[nipd-1]))){
+                ereport(ERROR,
+                        (errcode(ERRCODE_INDEX_CORRUPTED),
+                                errmsg("index \"%s\": posting list contains invalid heap pointer on block %u",
+                                       RelationGetRelationName(rel), blkno)));
+            }
+            pfree(ipd);
         }
     }
 }
