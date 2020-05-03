@@ -39,6 +39,19 @@ typedef struct GinScanItem
 	struct GinScanItem *next;
 } GinScanItem;
 
+/*
+ * GinPostingTreeScanItem represents one item of depth-first scan of GIN  posting tree.
+ */
+typedef struct GinPostingTreeScanItem
+{
+    int			depth;
+    PostingItem	*parenttup;
+    BlockNumber parentblk;
+    BlockNumber blkno;
+    struct GinPostingTreeScanItem *next;
+} GinPostingTreeScanItem;
+
+
 PG_FUNCTION_INFO_V1(gin_index_parent_check);
 
 static void gin_index_checkable(Relation rel);
@@ -144,6 +157,154 @@ gin_index_checkable(Relation rel)
 				 errdetail("Index is not valid")));
 }
 
+/*
+ * Allocates memory context and scans through postigTree graph
+ *
+ */
+static void
+gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting_tree_root)
+{
+    BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
+    GinPostingTreeScanItem *stack;
+    MemoryContext mctx;
+    MemoryContext oldcontext;
+
+    int			leafdepth;
+
+    mctx = AllocSetContextCreate(CurrentMemoryContext,
+                                 "amcheck context",
+                                 ALLOCSET_DEFAULT_SIZES);
+    oldcontext = MemoryContextSwitchTo(mctx);
+
+    /*
+     * We don't know the height of the tree yet, but as soon as we encounter a
+     * leaf page, we will set 'leafdepth' to its depth.
+     */
+    leafdepth = -1;
+
+    /* Start the scan at the root page */
+    stack = (GinPostingTreeScanItem *) palloc0(sizeof(GinPostingTreeScanItem));
+    stack->depth = 0;
+    stack->parenttup = NULL;
+    stack->parentblk = InvalidBlockNumber;
+    stack->blkno = posting_tree_root;
+
+    while (stack)
+    {
+//        elog(INFO, "processing block %u", stack->blkno);
+        GinPostingTreeScanItem *stack_next;
+        Buffer		buffer;
+        Page		page;
+        OffsetNumber  i, maxoff;
+
+        CHECK_FOR_INTERRUPTS();
+
+        buffer = ReadBufferExtended(rel, MAIN_FORKNUM, stack->blkno,
+                                    RBM_NORMAL, strategy);
+        LockBuffer(buffer, GIN_SHARE);
+        page = (Page) BufferGetPage(buffer);
+//        elog(INFO, "before assert");
+        Assert(GinPageIsData(page));
+//        elog(INFO, "after assert");
+
+        /* Check that the tree has the same height in all branches */
+        if (GinPageIsLeaf(page))
+        {
+//            elog(INFO, "page is leaf");
+            if (leafdepth == -1)
+                leafdepth = stack->depth;
+            else if (stack->depth != leafdepth)
+                ereport(ERROR,
+                        (errcode(ERRCODE_INDEX_CORRUPTED),
+                                errmsg("index \"%s\": internal pages traversal encountered leaf page unexpectedly on block %u",
+                                       RelationGetRelationName(rel), stack->blkno)));
+        }
+//        elog(INFO, "after checking for leaf assert");
+
+        if (stack->parenttup) {
+//            elog(INFO, "parent block u% , parent offset u%", ItemPointerGetBlockNumberNoCheck(&stack->parenttup->key), ItemPointerGetOffsetNumberNoCheck(&stack->parenttup->key) );
+        }
+//        elog(INFO, "after printing parent info");
+
+        /*
+         * Check that tuples in each page are properly ordered and consistent with parent high key
+         */
+        maxoff = PageGetMaxOffsetNumber(page);
+//        elog(INFO, "maxoff %u", (unsigned int)maxoff);
+        for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
+        {
+            PostingItem* posting_item = GinDataPageGetPostingItem(page, i);
+            if (ItemPointerGetBlockNumberNoCheck(&posting_item->key) == 0 || ItemPointerGetOffsetNumberNoCheck(&posting_item->key) == 0)
+            {
+                continue;
+            }
+//            elog(INFO, "block %u offset %u", ItemPointerGetBlockNumber(&posting_item->key), ItemPointerGetOffsetNumber(&posting_item->key) );
+//            if (i!= FirstOffsetNumber){
+//                PostingItem* previous_posting_item = GinDataPageGetPostingItem(page, i-1);
+//                if (ItemPointerCompare(&posting_item->key, &previous_posting_item->key) < 0 ) {
+//                    ereport(ERROR,
+//                            (errcode(ERRCODE_INDEX_CORRUPTED),
+//                                    errmsg("index \"%s\" has wrong tuple order in posting tree, block %u, offset %u",
+//                                           RelationGetRelationName(rel), stack->blkno, i)));
+//                }
+//
+//            }
+//            elog(INFO, "Check if this tuple is consistent with the downlink in the");
+
+            /*
+             * Check if this tuple is consistent with the downlink in the
+             * parent.
+             */
+//            if (stack->parenttup && i == maxoff) {
+//                if (ItemPointerCompare(&stack->parenttup->key, &posting_item->key) < 0) {
+//                    ereport(ERROR,
+//                            (errcode(ERRCODE_INDEX_CORRUPTED),
+//                                    errmsg("index \"%s\" has inconsistent records on page %u offset %u",
+//                                           RelationGetRelationName(rel), stack->blkno, i)));
+//
+//                }
+//            }
+
+//            elog(INFO, " If this is an internal page, recurse into the child ");
+            /* If this is an internal page, recurse into the child */
+            if (!GinPageIsLeaf(page))
+            {
+                GinPostingTreeScanItem *ptr;
+
+                ptr = (GinPostingTreeScanItem *) palloc(sizeof(GinPostingTreeScanItem));
+                ptr->depth = stack->depth + 1;
+                ptr->parenttup = posting_item;
+                ptr->parentblk = stack->blkno;
+                ptr->blkno = BlockIdGetBlockNumber(&posting_item->child_blkno);
+                ptr->next = stack->next;
+                stack->next = ptr;
+            }
+
+        }
+
+//        elog(INFO, " Step to next item in the queue ");
+        LockBuffer(buffer, GIN_UNLOCK);
+        ReleaseBuffer(buffer);
+
+        /* Step to next item in the queue */
+        stack_next = stack->next;
+//        elog(INFO, " before freeing parent tup");
+//TODO uncomment and fix
+//        if (stack->parenttup)
+//            pfree(stack->parenttup);
+
+//        elog(INFO, " after freeing parent tup");
+        pfree(stack);
+//        elog(INFO, " after freeing stack");
+
+        stack = stack_next;
+    }
+//    elog(INFO, "while ended");
+
+    MemoryContextSwitchTo(oldcontext);
+    MemoryContextDelete(mctx);
+}
+
 static void validate_leaf(Page page, Relation rel, BlockNumber blkno) {
     OffsetNumber  i, maxoff;
     maxoff = PageGetMaxOffsetNumber(page);
@@ -152,6 +313,8 @@ static void validate_leaf(Page page, Relation rel, BlockNumber blkno) {
         IndexTuple idxtuple = (IndexTuple) PageGetItem(page, iid);
         if (GinIsPostingTree(idxtuple)) {
             elog(INFO, "validating posting tree on page %u, block %u, offset %u", page, blkno, i);
+            BlockNumber rootPostingTree = GinGetPostingTree(idxtuple);
+            gin_check_posting_tree_parent_keys_consistency(rel, rootPostingTree);
         } else {
             elog(INFO, "validating posting list on page %u, block %u, offset %u", page, blkno, i);
 
@@ -453,3 +616,5 @@ gin_refind_parent(Relation rel, BlockNumber parentblkno,
 
     return result;
 }
+
+

@@ -145,16 +145,17 @@ PageGetItemIdCareful(Relation rel, BlockNumber block, Page page,
 	 * never uses either.  Verify that line pointer has storage, too, since
 	 * even LP_DEAD items should.
 	 */
-	if (ItemIdIsRedirected(itemid) || !ItemIdIsUsed(itemid) ||
-		ItemIdGetLength(itemid) == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("invalid line pointer storage in index \"%s\"",
-						RelationGetRelationName(rel)),
-				 errdetail_internal("Index tid=(%u,%u) lp_off=%u, lp_len=%u lp_flags=%u.",
-									block, offset, ItemIdGetOffset(itemid),
-									ItemIdGetLength(itemid),
-									ItemIdGetFlags(itemid))));
+// TODO adapt for gin and uncomment
+//	if (ItemIdIsRedirected(itemid) || !ItemIdIsUsed(itemid) ||
+//		ItemIdGetLength(itemid) == 0)
+//		ereport(ERROR,
+//				(errcode(ERRCODE_INDEX_CORRUPTED),
+//				 errmsg("invalid line pointer storage in index \"%s\"",
+//						RelationGetRelationName(rel)),
+//				 errdetail_internal("Index tid=(%u,%u) lp_off=%u, lp_len=%u lp_flags=%u.",
+//									block, offset, ItemIdGetOffset(itemid),
+//									ItemIdGetLength(itemid),
+//									ItemIdGetFlags(itemid))));
 
 	return itemid;
 }
