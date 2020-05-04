@@ -45,8 +45,7 @@ typedef struct GinScanItem
 typedef struct GinPostingTreeScanItem
 {
     int			depth;
-    PostingItem	*parenttup;
-    BlockNumber parentblk;
+    ItemPointer parentkey;
     BlockNumber blkno;
     struct GinPostingTreeScanItem *next;
 } GinPostingTreeScanItem;
@@ -185,8 +184,7 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
     /* Start the scan at the root page */
     stack = (GinPostingTreeScanItem *) palloc0(sizeof(GinPostingTreeScanItem));
     stack->depth = 0;
-    stack->parenttup = NULL;
-    stack->parentblk = InvalidBlockNumber;
+    stack->parentkey = NULL;
     stack->blkno = posting_tree_root;
 
     while (stack)
@@ -208,8 +206,7 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
 //        elog(INFO, "after assert");
 
         /* Check that the tree has the same height in all branches */
-        if (GinPageIsLeaf(page))
-        {
+        if (GinPageIsLeaf(page)) {
             if (leafdepth == -1)
                 leafdepth = stack->depth;
             else if (stack->depth != leafdepth)
@@ -217,6 +214,19 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
                         (errcode(ERRCODE_INDEX_CORRUPTED),
                                 errmsg("index \"%s\": internal pages traversal encountered leaf page unexpectedly on block %u",
                                        RelationGetRelationName(rel), stack->blkno)));
+            ItemPointerData minItem;
+            ItemPointerSetMin(&minItem);
+            int nlist;
+            ItemPointerData *list;
+            elog(INFO, "before GinDataLeafPageGetItems");
+            list = GinDataLeafPageGetItems(page, nlist, minItem);
+            elog(INFO, "after GinDataLeafPageGetItems");
+            if (stack->parentkey && ItemPointerCompare(stack->parentkey, &list[0]) < 0) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INDEX_CORRUPTED),
+                                errmsg("index \"%s\": tid exceeds parent's high key in postingTree leaf on block %u",
+                                       RelationGetRelationName(rel), stack->blkno)));
+            }
         } else {
 
 
@@ -251,9 +261,9 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
                  * Check if this tuple is consistent with the downlink in the
                  * parent.
                  */
-                if (stack->parenttup && i == maxoff) {
+                if (stack->parentkey && i == maxoff) {
                     elog(INFO, "max offset is reached");
-                    if (ItemPointerCompare(&stack->parenttup->key, &posting_item->key) < 0) {
+                    if (ItemPointerCompare(stack->parentkey, &posting_item->key) < 0) {
                         ereport(ERROR,
                                 (errcode(ERRCODE_INDEX_CORRUPTED),
                                         errmsg("index \"%s\" has inconsistent records on page %u offset %u",
@@ -269,8 +279,7 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
 
                     ptr = (GinPostingTreeScanItem *) palloc(sizeof(GinPostingTreeScanItem));
                     ptr->depth = stack->depth + 1;
-                    ptr->parenttup = posting_item;
-                    ptr->parentblk = stack->blkno;
+                    ptr->parentkey = &posting_item->key;
                     ptr->blkno = BlockIdGetBlockNumber(&posting_item->child_blkno);
                     ptr->next = stack->next;
                     stack->next = ptr;
@@ -284,11 +293,6 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
         /* Step to next item in the queue */
         stack_next = stack->next;
 //        elog(INFO, " before freeing parent tup");
-        //TODO uncomment and fix
-//                if (stack->parenttup)
-//                    pfree(stack->parenttup);
-
-        //        elog(INFO, " after freeing parent tup");
         pfree(stack);
         //        elog(INFO, " after freeing stack");
 
@@ -613,5 +617,3 @@ gin_refind_parent(Relation rel, BlockNumber parentblkno,
 
     return result;
 }
-
-
