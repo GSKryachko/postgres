@@ -20,11 +20,13 @@
 #include "postgres.h"
 
 #include "access/gin_private.h"
+#include "access/nbtree.h"
 #include "amcheck.h"
 #include "catalog/pg_am.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "string.h"
 
 /*
  * GinScanItem represents one item of depth-first scan of GIN index.
@@ -201,9 +203,7 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
                                     RBM_NORMAL, strategy);
         LockBuffer(buffer, GIN_SHARE);
         page = (Page) BufferGetPage(buffer);
-//        elog(INFO, "before assert");
         Assert(GinPageIsData(page));
-//        elog(INFO, "after assert");
 
         /* Check that the tree has the same height in all branches */
         if (GinPageIsLeaf(page)) {
@@ -218,9 +218,7 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
             ItemPointerSetMin(&minItem);
             int nlist;
             ItemPointerData *list;
-            elog(INFO, "before GinDataLeafPageGetItems");
             list = GinDataLeafPageGetItems(page, nlist, minItem);
-            elog(INFO, "after GinDataLeafPageGetItems");
             if (stack->parentkey && ItemPointerCompare(stack->parentkey, &list[0]) < 0) {
                 ereport(ERROR,
                         (errcode(ERRCODE_INDEX_CORRUPTED),
@@ -255,14 +253,12 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
                     }
 
                 }
-//            elog(INFO, "Check if this tuple is consistent with the downlink in the");
 
                 /*
                  * Check if this tuple is consistent with the downlink in the
                  * parent.
                  */
                 if (stack->parentkey && i == maxoff) {
-                    elog(INFO, "max offset is reached");
                     if (ItemPointerCompare(stack->parentkey, &posting_item->key) < 0) {
                         ereport(ERROR,
                                 (errcode(ERRCODE_INDEX_CORRUPTED),
@@ -272,7 +268,6 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
                     }
                 }
 
-//            elog(INFO, " If this is an internal page, recurse into the child ");
                 /* If this is an internal page, recurse into the child */
                 if (!GinPageIsLeaf(page)) {
                     GinPostingTreeScanItem *ptr;
@@ -292,15 +287,9 @@ gin_check_posting_tree_parent_keys_consistency(Relation rel, BlockNumber posting
 
         /* Step to next item in the queue */
         stack_next = stack->next;
-//        elog(INFO, " before freeing parent tup");
         pfree(stack);
-        //        elog(INFO, " after freeing stack");
-
         stack = stack_next;
     }
-
-
-    //    elog(INFO, "while ended");
 
     MemoryContextSwitchTo(oldcontext);
     MemoryContextDelete(mctx);
@@ -345,7 +334,7 @@ gin_check_parent_keys_consistency(Relation rel)
 	GinScanItem *stack;
 	MemoryContext mctx;
 	MemoryContext oldcontext;
-    GinState  *state;
+    GinState state;
 
     int			leafdepth;
 
@@ -353,8 +342,7 @@ gin_check_parent_keys_consistency(Relation rel)
 								 "amcheck context",
 								 ALLOCSET_DEFAULT_SIZES);
 	oldcontext = MemoryContextSwitchTo(mctx);
-    state = (GinState *) palloc(sizeof(GinState));
-    initGinState(state, rel);
+    initGinState(&state, rel);
 
     /*
      * We don't know the height of the tree yet, but as soon as we encounter a
@@ -372,6 +360,7 @@ gin_check_parent_keys_consistency(Relation rel)
 
 	while (stack)
 	{
+        elog(INFO, "processing block %u", stack->blkno);
         GinScanItem *stack_next;
 		Buffer		buffer;
 		Page		page;
@@ -397,16 +386,19 @@ gin_check_parent_keys_consistency(Relation rel)
          */
         if (stack -> parenttup != NULL ) {
             GinNullCategory parent_key_category;
-            Datum parent_key = gintuple_get_key(state, stack->parenttup, &parent_key_category);
+            Datum parent_key = gintuple_get_key(&state, stack->parenttup, &parent_key_category);
             maxoff = PageGetMaxOffsetNumber(page);
             ItemId iid = PageGetItemIdCareful(rel, stack->blkno, page, maxoff, sizeof(GinPageOpaqueData));
             IndexTuple idxtuple = (IndexTuple) PageGetItem(page, iid);
-            OffsetNumber attnum = gintuple_get_attrnum(state, idxtuple);
+            OffsetNumber attnum = gintuple_get_attrnum(&state, idxtuple);
             GinNullCategory page_max_key_category;
-            Datum page_max_key = gintuple_get_key(state, idxtuple, &page_max_key_category);
+            Datum page_max_key = gintuple_get_key(&state, idxtuple, &page_max_key_category);
 
             if (GinPageGetOpaque(page)->rightlink != InvalidBlockNumber &&
-            ginCompareEntries(state, attnum, page_max_key, parent_key, page_max_key_category, parent_key_category) <= 0 ) {
+                DatumGetInt32(DirectFunctionCall2Coll(btint4cmp,
+                                                          state.supportCollation[attnum - 1],
+                                                          parent_key, page_max_key_category)) <= 0) {
+//            ginCompareEntries(&state, attnum, page_max_key, parent_key, page_max_key_category, parent_key_category) <= 0 ) {
                 elog(INFO, "split detected");
                 /* split page detected, install right link to the stack */
                 GinScanItem *ptr = (GinScanItem *) palloc(sizeof(GinScanItem));
@@ -442,8 +434,7 @@ gin_check_parent_keys_consistency(Relation rel)
 		{
 			ItemId iid = PageGetItemIdCareful(rel, stack->blkno, page, i, sizeof(GinPageOpaqueData));
 			IndexTuple	idxtuple = (IndexTuple) PageGetItem(page, iid);
-            OffsetNumber attnum = gintuple_get_attrnum(state, idxtuple);
-
+            OffsetNumber attnum = gintuple_get_attrnum(&state, idxtuple);
 			if (MAXALIGN(ItemIdGetLength(iid)) != MAXALIGN(IndexTupleSize(idxtuple)))
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -453,13 +444,18 @@ gin_check_parent_keys_consistency(Relation rel)
             GinNullCategory prev_key_category;
             Datum prev_key;
             GinNullCategory current_key_category;
-            Datum current_key = gintuple_get_key(state, idxtuple, &current_key_category);
+            Datum current_key = gintuple_get_key(&state, idxtuple, &current_key_category);
 
-            if (i != FirstOffsetNumber) {
-                prev_key = gintuple_get_key(state, prev_tuple, &prev_key_category);
-
-                if (ginCompareEntries(state, attnum, prev_key, current_key, prev_key_category, current_key_category) <= 0)
-                    ereport(ERROR,
+            if (i != FirstOffsetNumber && stack->blkno != (BlockNumber) 1) {
+                prev_key = gintuple_get_key(&state, prev_tuple, &prev_key_category);
+//                elog(INFO, "prev_key_category %u, current_key_category %u", prev_key_category, current_key_category);
+                elog(INFO, "prev_key %u, current_key %u", prev_key, current_key);
+                elog(INFO, "collation id %u", state.supportCollation[0]);
+                if (DatumGetInt32(DirectFunctionCall2Coll(btint4cmp,
+                                                          state.supportCollation[attnum - 1],
+                                                          prev_key, current_key)) >= 0)
+//                if (ginCompareEntries(&state, attnum, prev_key, current_key, prev_key_category, current_key_category) >= 0)
+                        ereport(ERROR,
                             (errcode(ERRCODE_INDEX_CORRUPTED),
                                     errmsg("index \"%s\" has wrong tuple order, block %u, offset %u",
                                            RelationGetRelationName(rel), stack->blkno, i)));
@@ -473,10 +469,18 @@ gin_check_parent_keys_consistency(Relation rel)
             if (stack->parenttup &&
                 i == maxoff) {
                 GinNullCategory parent_key_category;
-                Datum parent_key = gintuple_get_key(state, stack->parenttup, &parent_key_category);
+                Datum parent_key = gintuple_get_key(&state, stack->parenttup, &parent_key_category);
+//                elog(INFO, "parent_key %lu, current_key %lu", parent_key, current_key);
+//                elog(INFO, "parent_key %lu, current_key %lu", DatumGetInt32(parent_key), DatumGetInt32(current_key));
+//                elog(INFO, "comparision result %i", ginCompareEntries(&state, attnum, current_key, parent_key, current_key_category, parent_key_category));
+//                elog(INFO, "comparision result %i",  DatumGetInt32(DirectFunctionCall2Coll(btint4cmp,
+//                                                                                     state.supportCollation[attnum - 1],
+//                                                                                     current_key, parent_key)));
 
-                if (ginCompareEntries(state, attnum, current_key, parent_key, current_key_category, parent_key_category) <= 0) {
-
+//                if (ginCompareEntries(&state, attnum, current_key, parent_key, current_key_category, parent_key_category) < 0) {
+                if (DatumGetInt32(DirectFunctionCall2Coll(btint4cmp,
+                                                          state.supportCollation[attnum - 1],
+                                                          current_key, parent_key)) < 0){
 
                     /*
                      * There was a discrepancy between parent and child tuples.
@@ -494,8 +498,12 @@ gin_check_parent_keys_consistency(Relation rel)
                         elog(NOTICE, "Unable to find parent tuple for block %u on block %u due to concurrent split",
                              stack->blkno, stack->parentblk);
                     else {
-                        parent_key = gintuple_get_key(state, stack->parenttup, &parent_key_category);
-                        if (ginCompareEntries(state, attnum, current_key, parent_key, current_key_category, parent_key_category) <=0)
+                        parent_key = gintuple_get_key(&state, stack->parenttup, &parent_key_category);
+                        elog(INFO, "parent_key %u, current_key %u after gin_refind_parent", parent_key, current_key);
+//                        if (ginCompareEntries(&state, attnum, current_key, parent_key, current_key_category, parent_key_category) <0)
+                        if (DatumGetInt32(DirectFunctionCall2Coll(btint4cmp,
+                                                                      state.supportCollation[attnum - 1],
+                                                                      current_key, parent_key)) < 0)
                         ereport(ERROR,
                                 (errcode(ERRCODE_INDEX_CORRUPTED),
                                         errmsg("index \"%s\" has inconsistent records on page %u offset %u",
