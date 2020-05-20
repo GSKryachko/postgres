@@ -302,11 +302,11 @@ static void validate_leaf(Page page, Relation rel, BlockNumber blkno) {
         ItemId iid = PageGetItemIdCareful(rel, blkno, page, i, sizeof(GinPageOpaqueData));
         IndexTuple idxtuple = (IndexTuple) PageGetItem(page, iid);
         if (GinIsPostingTree(idxtuple)) {
-            elog(INFO, "validating posting tree on page %u, block %u, offset %u", page, blkno, i);
+//            elog(INFO, "validating posting tree on page %u, block %u, offset %u", page, blkno, i);
             BlockNumber rootPostingTree = GinGetPostingTree(idxtuple);
             gin_check_posting_tree_parent_keys_consistency(rel, rootPostingTree);
         } else {
-            elog(INFO, "validating posting list on page %u, block %u, offset %u", page, blkno, i);
+//            elog(INFO, "validating posting list on page %u, block %u, offset %u", page, blkno, i);
 
             ItemPointer ipd;
             int			nipd;
@@ -442,10 +442,11 @@ gin_check_parent_keys_consistency(Relation rel)
             Datum prev_key;
             GinNullCategory current_key_category;
             Datum current_key = gintuple_get_key(&state, idxtuple, &current_key_category);
+//            elog(INFO, "current_key %s, depth %u", DatumGetCString(current_key), stack->depth);
 
+            // (apparently) first block is metadata, skip order check
             if (i != FirstOffsetNumber && stack->blkno != (BlockNumber) 1) {
                 prev_key = gintuple_get_key(&state, prev_tuple, &prev_key_category);
-
                 if (ginCompareEntries(&state, attnum,  prev_key, prev_key_category, current_key, current_key_category) >= 0)
                         ereport(ERROR,
                             (errcode(ERRCODE_INDEX_CORRUPTED),
@@ -461,9 +462,6 @@ gin_check_parent_keys_consistency(Relation rel)
                 i == maxoff) {
                 GinNullCategory parent_key_category;
                 Datum parent_key = gintuple_get_key(&state, stack->parenttup, &parent_key_category);
-//                elog(INFO, "parent_key %lu, current_key %lu", parent_key, current_key);
-//                elog(INFO, "parent_key %lu, current_key %lu", DatumGetInt32(parent_key), DatumGetInt32(current_key));
-//                elog(INFO, "comparision result %i", ginCompareEntries(&state, attnum, current_key, parent_key, current_key_category, parent_key_category));
 
                 if (ginCompareEntries(&state, attnum, current_key, current_key_category, parent_key, parent_key_category) > 0) {
                     /*
@@ -483,8 +481,6 @@ gin_check_parent_keys_consistency(Relation rel)
                              stack->blkno, stack->parentblk);
                     else {
                         parent_key = gintuple_get_key(&state, stack->parenttup, &parent_key_category);
-                        elog(INFO, "parent_key %u, current_key %u after gin_refind_parent", parent_key, current_key);
-
                         if (ginCompareEntries(&state, attnum, current_key, current_key_category, parent_key, parent_key_category) >0)
                         ereport(ERROR,
                                 (errcode(ERRCODE_INDEX_CORRUPTED),
@@ -506,7 +502,13 @@ gin_check_parent_keys_consistency(Relation rel)
 
 				ptr = (GinScanItem *) palloc(sizeof(GinScanItem));
 				ptr->depth = stack->depth + 1;
-				ptr->parenttup = CopyIndexTuple(idxtuple);
+				// last tuple in layer has no high key
+				if (i != maxoff &&  !GinPageGetOpaque(page)->rightlink) {
+                    ptr->parenttup = CopyIndexTuple(idxtuple);
+                }
+				else {
+				    ptr->parenttup = NULL;
+				}
 				ptr->parentblk = stack->blkno;
 				ptr->blkno = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
 				ptr->parentlsn = lsn;
