@@ -704,3 +704,37 @@ ginUpdateStats(Relation index, const GinStatsData *stats, bool is_build)
 
 	END_CRIT_SECTION();
 }
+
+/*
+ * Verify that a freshly-read page looks sane.
+ */
+void
+gincheckpage(Relation rel, Buffer buf)
+{
+    Page		page = BufferGetPage(buf);
+
+    /*
+     * ReadBuffer verifies that every newly-read page passes
+     * PageHeaderIsValid, which means it either contains a reasonably sane
+     * page header or is all-zero.  We have to defend against the all-zero
+     * case, however.
+     */
+    if (PageIsNew(page))
+        ereport(ERROR,
+                (errcode(ERRCODE_INDEX_CORRUPTED),
+                        errmsg("index \"%s\" contains unexpected zero page at block %u",
+                               RelationGetRelationName(rel),
+                               BufferGetBlockNumber(buf)),
+                        errhint("Please REINDEX it.")));
+
+    /*
+     * Additionally check that the special area looks sane.
+     */
+    if (PageGetSpecialSize(page) != MAXALIGN(sizeof(GinPageOpaqueData)))
+        ereport(ERROR,
+                (errcode(ERRCODE_INDEX_CORRUPTED),
+                        errmsg("index \"%s\" contains corrupted page at block %u",
+                               RelationGetRelationName(rel),
+                               BufferGetBlockNumber(buf)),
+                        errhint("Please REINDEX it.")));
+}
